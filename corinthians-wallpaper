@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import functools
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+import random
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+BASE_DIR = Path.home() / "Pictures" / "Corinthians-Agencia"
+MANIFEST = BASE_DIR / "manifest.json"
+STATE = BASE_DIR / "state.json"
+RECENT_BATCH = BASE_DIR / "recent-downloads.json"
+WALLPAPER_DIR = BASE_DIR / "wallpaper-ready"
+DEFAULT_SIZE = (1920, 1080)
+DEFAULT_PAGE = "https://agencia.corinthians.com.br/"
+DEFAULT_MAX_PHOTOS = 90
+DEFAULT_MAX_PAGES = 20
+UA = "Mozilla/5.0 (X11; Linux x86_64) CorinthiansWallpaper/1.0"
+LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+# Fotos públicas da Agência têm no máximo ~1000px; ampliar mais que isso borra.
+MAX_UPSCALE = 1.3
+# Por quanto tempo o rotate prioriza o último lote baixado.
+RECENT_TTL = dt.timedelta(hours=48)
+# Mudou a regra de renderização? Incremente para invalidar wallpaper-ready.
+RENDER_VERSION = 2
+NET_ERRORS = (urllib.error.URLError, TimeoutError, OSError)
+
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_json(path, data):
+    write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def fetch_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as res:
+        return res.read().decode("utf-8", errors="replace")
+
+
+def download(url, dest):
+    """Baixa para .part, valida como imagem e só então move para o destino."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    part = dest.with_name(dest.name + ".part")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            part.write_bytes(res.read())
+        with Image.open(part) as img:
+            img.verify()
+        os.replace(part, dest)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def page_albums(page_url):
+    body = fetch_text(page_url)
+    links = re.findall(r'href="([^"]*/album/[^"]+)"', body)
+    seen = []
+    for link in links:
+        url = urllib.parse.urljoin(page_url, html.unescape(link))
+        if url not in seen:
+            seen.append(url)
+    return seen
+
+
+def paginated_url(start_url, offset):
+    parsed = urllib.parse.urlparse(start_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    start_page = int(query.get("page", ["1"])[0])
+    page = start_page + offset
+    if page <= 1:
+        query.pop("page", None)
+    else:
+        query["page"] = [str(page)]
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
+
+
+def collect_new_photos(page_url, existing_urls, limit, max_pages, stop_at_known):
+    collected = []
+    seen_albums = set()
+    seen_photos = set()
+    found_known = False
+
+    for offset in range(max_pages):
+        current_page = paginated_url(page_url, offset)
+        try:
+            albums = page_albums(current_page)
+        except NET_ERRORS as exc:
+            if offset == 0:
+                raise  # site inacessível: o sync deve falhar
+            log(f"falha ao ler {current_page}: {exc}")
+            break
+        if not albums:
+            break
+
+        for album in albums:
+            if album in seen_albums:
+                continue
+            seen_albums.add(album)
+            try:
+                photos = album_photos(album)
+            except NET_ERRORS as exc:
+                log(f"falha ao ler álbum {album}: {exc}")
+                continue
+            for photo in photos:
+                url = photo["url"]
+                if url in seen_photos:
+                    continue
+                seen_photos.add(url)
+                if url in existing_urls:
+                    found_known = True
+                    if stop_at_known:
+                        return collected
+                    continue
+                photo["newer_than_collection"] = not found_known
+                collected.append(photo)
+                if len(collected) >= limit:
+                    return collected
+
+    return collected
+
+
+def album_photos(album_url):
+    body = fetch_text(album_url)
+    title = re.search(r"<h2[^>]*>(.*?)</h2>", body, re.S)
+    title = clean(title.group(1)) if title else album_url.rsplit("/", 1)[-1]
+    photos = []
+    for match in re.finditer(
+        r'data-large="([^"]+)".*?data-description="([^"]*)".*?data-credit="([^"]*)"',
+        body,
+        re.S,
+    ):
+        photos.append(
+            {
+                "album_url": album_url,
+                "album": title,
+                "url": html.unescape(match.group(1)),
+                "description": clean(html.unescape(match.group(2))),
+                "credit": clean(html.unescape(match.group(3))),
+            }
+        )
+    return photos
+
+
+def clean(value):
+    value = re.sub(r"<[^>]+>", "", value)
+    value = html.unescape(value)
+    return " ".join(value.split())
+
+
+def load_manifest():
+    return read_json(MANIFEST, [])
+
+
+def available_items():
+    return [item for item in load_manifest() if Path(item.get("file", "")).exists()]
+
+
+def load_collection():
+    items = load_manifest()
+    known_files = {item.get("file") for item in items}
+    for path in sorted(BASE_DIR.glob("agencia-corinthians-*")):
+        if not path.is_file() or path.suffix == ".part" or str(path) in known_files:
+            continue
+        items.append({"file": str(path), "wallpaper": "", "album": "Arquivo local", "credit": ""})
+    return items
+
+
+def load_state():
+    return read_json(STATE, {})
+
+
+def save_state(item, **extra):
+    state = load_state()
+    state.update(
+        {
+            "last_file": item["file"],
+            "last_wallpaper": item.get("wallpaper", ""),
+            "last_album": item.get("album", ""),
+            "last_credit": item.get("credit", ""),
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        },
+        **extra,
+    )
+    write_json(STATE, state)
+
+
+def save_manifest(items):
+    write_json(MANIFEST, items)
+    credits = BASE_DIR / "CREDITOS.txt"
+    lines = [
+        "Fotos baixadas da Agência Corinthians para uso local como wallpaper.",
+        "Não remova marca d'água, não publique sem autorização e mantenha os créditos.",
+        "",
+    ]
+    for item in items:
+        lines.append(f"{item['file']}")
+        lines.append(f"  Álbum: {item.get('album', '')}")
+        lines.append(f"  Crédito: {item.get('credit', '')}")
+        lines.append(f"  Fonte: {item.get('album_url', '')}")
+        lines.append("")
+    write_atomic(credits, "\n".join(lines))
+
+
+def load_recent_files():
+    """Arquivos do último lote, apenas enquanto o lote tiver menos de RECENT_TTL."""
+    data = read_json(RECENT_BATCH, {})
+    try:
+        downloaded_at = dt.datetime.fromisoformat(data["downloaded_at"])
+    except (KeyError, TypeError, ValueError):
+        return set()
+    if dt.datetime.now() - downloaded_at > RECENT_TTL:
+        return set()
+    return set(data.get("files", []))
+
+
+def save_recent_batch(items):
+    write_json(
+        RECENT_BATCH,
+        {
+            "downloaded_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "files": [item["file"] for item in items],
+        },
+    )
+
+
+def next_file_index(items):
+    indexes = []
+    paths = [item.get("file", "") for item in items]
+    paths.extend(str(path) for path in BASE_DIR.glob("agencia-corinthians-*"))
+    for value in paths:
+        match = re.search(r"agencia-corinthians-(\d+)", Path(value).name)
+        if match:
+            indexes.append(int(match.group(1)))
+    return max(indexes, default=0) + 1
+
+
+def remove_items(items):
+    for item in items:
+        source = Path(item["file"])
+        wallpaper_value = item.get("wallpaper")
+        source.unlink(missing_ok=True)
+        if wallpaper_value:
+            Path(wallpaper_value).unlink(missing_ok=True)
+        print(f"removendo antiga: {source}")
+
+
+@functools.lru_cache(maxsize=None)
+def get_target_size():
+    try:
+        output = subprocess.check_output(["xrandr", "--current"], text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return DEFAULT_SIZE
+
+    # Prefere o monitor primário; senão, o primeiro conectado.
+    match = re.search(r" connected primary (\d+)x(\d+)\+", output) or re.search(
+        r" connected (\d+)x(\d+)\+", output
+    )
+    if not match:
+        return DEFAULT_SIZE
+    return int(match.group(1)), int(match.group(2))
+
+
+def resize_cover(image, size):
+    target_w, target_h = size
+    src_w, src_h = image.size
+    scale = max(target_w / src_w, target_h / src_h)
+    resized = image.resize((round(src_w * scale), round(src_h * scale)), LANCZOS)
+    left = (resized.width - target_w) // 2
+    top = (resized.height - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
+def resize_contain(image, size, margin=0.035, max_scale=MAX_UPSCALE):
+    target_w, target_h = size
+    max_w = round(target_w * (1 - margin * 2))
+    max_h = round(target_h * (1 - margin * 2))
+    src_w, src_h = image.size
+    scale = min(max_w / src_w, max_h / src_h, max_scale)
+    return image.resize((round(src_w * scale), round(src_h * scale)), LANCZOS)
+
+
+def render_path(source, size):
+    return WALLPAPER_DIR / f"{Path(source).stem}-{size[0]}x{size[1]}-v{RENDER_VERSION}.jpg"
+
+
+def render_wallpaper(source_path, size=None):
+    size = size or get_target_size()
+    source = Path(source_path)
+    WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
+    dest = render_path(source, size)
+
+    if dest.exists() and dest.stat().st_mtime >= source.stat().st_mtime:
+        return dest
+
+    with Image.open(source) as raw:
+        image = ImageOps.exif_transpose(raw).convert("RGB")
+
+    target_ratio = size[0] / size[1]
+    source_ratio = image.width / image.height
+    ratio_delta = abs(source_ratio - target_ratio) / target_ratio
+    cover_scale = max(size[0] / image.width, size[1] / image.height)
+
+    # Preenche a tela só se o formato for parecido E não precisar ampliar demais.
+    # Caso contrário: foto quase no tamanho original sobre fundo desfocado.
+    if ratio_delta <= 0.28 and image.width >= image.height and cover_scale <= MAX_UPSCALE:
+        wallpaper = resize_cover(image, size)
+    else:
+        background = resize_cover(image, size)
+        background = background.filter(ImageFilter.GaussianBlur(radius=28))
+        background = ImageEnhance.Brightness(background).enhance(0.48)
+        background = ImageEnhance.Contrast(background).enhance(0.92)
+
+        foreground = resize_contain(image, size)
+        shadow = Image.new("RGBA", (foreground.width + 32, foreground.height + 32), (0, 0, 0, 0))
+        shadow_box = Image.new("RGBA", foreground.size, (0, 0, 0, 105))
+        shadow.paste(shadow_box, (16, 16))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=18))
+
+        wallpaper = background.convert("RGBA")
+        x = (size[0] - foreground.width) // 2
+        y = (size[1] - foreground.height) // 2
+        wallpaper.alpha_composite(shadow, (x - 16, y - 16))
+        wallpaper.paste(foreground, (x, y))
+        wallpaper = wallpaper.convert("RGB")
+
+    wallpaper.save(dest, "JPEG", quality=92, optimize=True)
+    return dest
+
+
+def sync(args):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    items = load_collection()
+    existing = {item["url"]: item for item in items if item.get("url")}
+    available_slots = max(args.max_photos - len(items), 0)
+    download_limit = args.limit if available_slots == 0 else min(args.limit, available_slots)
+    stop_at_known = len(items) >= args.max_photos
+
+    try:
+        collected = collect_new_photos(
+            args.page_url,
+            set(existing),
+            download_limit,
+            args.max_pages,
+            stop_at_known,
+        )
+    except NET_ERRORS as exc:
+        log(f"site inacessível ({args.page_url}): {exc}")
+        return 1
+    next_index = next_file_index(items)
+    size = get_target_size()
+    new_items = []
+    failures = 0
+
+    # O finally garante que o que já foi baixado entra no manifesto,
+    # mesmo com erro ou Ctrl+C no meio (evita downloads duplicados depois).
+    try:
+        for n, photo in enumerate(collected, 1):
+            ext = Path(urllib.parse.urlparse(photo["url"]).path).suffix or ".jpg"
+            dest = BASE_DIR / f"agencia-corinthians-{next_index:03d}{ext}"
+            print(f"baixando {n}/{len(collected)}: {photo['url']}")
+            try:
+                download(photo["url"], dest)
+                photo["wallpaper"] = str(render_wallpaper(dest, size=size))
+            except NET_ERRORS as exc:  # inclui imagem inválida (PIL levanta OSError)
+                log(f"  ignorada: {exc}")
+                dest.unlink(missing_ok=True)
+                failures += 1
+                continue
+            next_index += 1
+            photo["file"] = str(dest)
+            photo["downloaded_at"] = dt.datetime.now().isoformat(timespec="seconds")
+            new_items.append(photo)
+            time.sleep(0.2)
+    finally:
+        newer_items = []
+        older_items = []
+        for item in new_items:
+            if item.pop("newer_than_collection", False):
+                newer_items.append(item)
+            else:
+                older_items.append(item)
+        items = newer_items + items + older_items
+
+        overflow = max(len(items) - args.max_photos, 0)
+        if overflow:
+            remove_items(items[-overflow:])
+            items = items[:-overflow]
+        if new_items:
+            save_recent_batch(new_items)
+        save_manifest(items)
+        print(
+            f"{len(new_items)} novas fotos; {failures} falhas; "
+            f"{len(items)}/{args.max_photos} disponíveis em {BASE_DIR}"
+        )
+    return 1 if failures and not new_items else 0
+
+
+def set_wallpaper(path):
+    uri = Path(path).resolve().as_uri()
+    settings = [
+        ("org.gnome.desktop.background", "picture-uri", uri),
+        ("org.gnome.desktop.background", "picture-uri-dark", uri),
+        ("org.gnome.desktop.background", "picture-options", "zoom"),
+        ("org.gnome.desktop.screensaver", "picture-uri", uri),
+        ("org.gnome.desktop.screensaver", "picture-options", "zoom"),
+    ]
+    for schema, key, value in settings:
+        result = subprocess.run(["gsettings", "set", schema, key, value], check=False)
+        if result.returncode != 0:
+            log(f"gsettings falhou: {schema} {key}")
+
+
+def pick_next(items, state):
+    """Fila embaralhada: passa por todas as candidatas antes de repetir."""
+    files = {item["file"]: item for item in items}
+    queue = [f for f in state.get("queue", []) if f in files]
+    if not queue:
+        queue = list(files)
+        random.shuffle(queue)
+        # Evita repetir a última foto logo na virada da fila.
+        if len(queue) > 1 and queue[0] == state.get("last_file"):
+            queue.append(queue.pop(0))
+    return files[queue[0]], queue[1:]
+
+
+def apply_item(item, **state_extra):
+    wallpaper = render_wallpaper(item["file"])
+    item["wallpaper"] = str(wallpaper)
+    set_wallpaper(wallpaper)
+    save_state(item, **state_extra)
+    print(f"foto: {item['file']}")
+    print(f"wallpaper: {wallpaper}")
+    print(f"credito: {item.get('credit', '')}")
+
+
+def no_photos():
+    log("Nenhuma foto encontrada. Rode: corinthians-wallpaper sync")
+    return 1
+
+
+def rotate(_args):
+    items = available_items()
+    if not items:
+        return no_photos()
+
+    # Lote recente (< RECENT_TTL) tem prioridade; depois, o acervo inteiro.
+    recent_files = load_recent_files()
+    candidates = [item for item in items if item["file"] in recent_files] or items
+    state = load_state()
+    if set(state.get("queue_pool", [])) != {item["file"] for item in candidates}:
+        state["queue"] = []  # conjunto de candidatas mudou: refaz a fila
+    item, queue = pick_next(candidates, state)
+    apply_item(item, queue=queue, queue_pool=sorted(i["file"] for i in candidates))
+    return 0
+
+
+def daily(_args):
+    items = available_items()
+    if not items:
+        return no_photos()
+
+    # Fixa a escolha do dia no state; não muda se o acervo mudar durante o dia.
+    state = load_state()
+    today = dt.date.today().isoformat()
+    by_file = {item["file"]: item for item in items}
+    if state.get("daily_date") == today and state.get("daily_file") in by_file:
+        item = by_file[state["daily_file"]]
+    else:
+        item = random.choice(items)
+    apply_item(item, daily_date=today, daily_file=item["file"])
+    return 0
+
+
+def prepare(_args):
+    items = available_items()
+    if not items:
+        return no_photos()
+
+    size = get_target_size()
+    keep = set()
+    for idx, item in enumerate(items, 1):
+        wallpaper = render_wallpaper(item["file"], size=size)
+        item["wallpaper"] = str(wallpaper)
+        keep.add(wallpaper)
+        print(f"{idx}/{len(items)} {wallpaper}")
+    save_manifest(items)
+
+    # Remove renders de versões/resoluções antigas.
+    stale = [p for p in WALLPAPER_DIR.glob("*.jpg") if p not in keep]
+    for path in stale:
+        path.unlink()
+    print(f"{len(stale)} renders antigos removidos")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("sync")
+    s.add_argument("--page-url", default=DEFAULT_PAGE)
+    s.add_argument("--limit", type=int, default=30, help="máximo de fotos novas por execução")
+    s.add_argument("--max-photos", type=int, default=DEFAULT_MAX_PHOTOS)
+    s.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+    sub.add_parser("rotate")
+    sub.add_parser("daily")
+    sub.add_parser("prepare")
+    args = parser.parse_args()
+    commands = {"sync": sync, "rotate": rotate, "daily": daily, "prepare": prepare}
+    raise SystemExit(commands[args.cmd](args))
+
+
+if __name__ == "__main__":
+    main()

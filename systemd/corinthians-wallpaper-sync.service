@@ -1,0 +1,6 @@
+[Unit]
+Description=Baixa fotos novas da Agência Corinthians
+
+[Service]
+Type=oneshot
+ExecStart=%h/Scripts/corinthians-wallpaper/corinthians-wallpaper sync

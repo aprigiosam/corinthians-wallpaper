@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync diario das fotos da Agência Corinthians
+
+[Timer]
+OnCalendar=*-*-* 09:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=corinthians-wallpaper-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Troca o wallpaper com fotos públicas da Agência Corinthians
+
+[Service]
+Type=oneshot
+ExecStart=%h/Scripts/corinthians-wallpaper/corinthians-wallpaper rotate

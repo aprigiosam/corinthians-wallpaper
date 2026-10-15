@@ -1,0 +1,11 @@
+[Unit]
+Description=Troca periodica do wallpaper Corinthians
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Unit=corinthians-wallpaper.service
+
+[Install]
+WantedBy=timers.target
